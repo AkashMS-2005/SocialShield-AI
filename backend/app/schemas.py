@@ -145,8 +145,8 @@ class ScanResponse(BaseModel):
     username:              str
     platform:              str
     classification:        Classification
-    risk_score:            Optional[float] = Field(None, ge=0.0, le=1.0,
-                                                   description="Composite risk score 0–1. "
+    risk_score:            Optional[float] = Field(None, ge=0.0, le=100.0,
+                                                   description="Composite risk score 0–100. "
                                                                "Null when evidence is insufficient.")
     ml_result:             MLResult
     nlp_result:            NLPResult

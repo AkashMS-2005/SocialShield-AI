@@ -1,10 +1,8 @@
 """
-routes/analytics.py – GET /api/analytics
-
-Aggregate statistics over all scans.
-Currently returns mock data; will query the DB in a later step.
+routes/analytics.py – Aggregate statistics across all real scans from SQLite.
 """
 from fastapi import APIRouter
+from app.database import query_analytics
 from app.schemas import AnalyticsResponse
 
 router = APIRouter()
@@ -13,24 +11,14 @@ router = APIRouter()
 @router.get("/analytics", response_model=AnalyticsResponse, summary="Aggregate scan analytics")
 async def get_analytics():
     """
-    Returns aggregate statistics across all scans.
-    **mock=true** – will be powered by real DB aggregates in a later step.
+    Returns real aggregate counts, platform distributions, and average risk score
+    from the SQLite scans database.
     """
+    data = query_analytics()
     return AnalyticsResponse(
-        total_scans=42,
-        classification_counts={
-            "Low risk": 18,
-            "Suspicious": 14,
-            "High risk": 7,
-            "Insufficient evidence": 3,
-        },
-        platform_counts={
-            "Instagram": 20,
-            "Facebook": 10,
-            "X": 8,
-            "YouTube": 4,
-        },
-        average_risk_score=0.48,
-        mock=True,
+        total_scans=data["total_scans"],
+        classification_counts=data["classification_counts"],
+        platform_counts=data["platform_counts"],
+        average_risk_score=data["average_risk_score"],
+        mock=False,
     )
-

@@ -1,158 +1,139 @@
 """
-routes/scan.py – POST /api/scan, POST /api/analyze-text, POST /api/bulk-scan
-
-All endpoints currently return MOCK, schema-valid responses labelled mock=true.
-They will be replaced with real ML/NLP pipeline calls in later steps.
+routes/scan.py – Production implementation of scan endpoints.
+Replaces all mocks with real ML, NLP, and SHAP execution.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from fastapi import APIRouter
+import csv
+import io
+from typing import List
+
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from app.schemas import (
     AccountInput,
     BulkScanInput,
     BulkScanResponse,
-    Classification,
-    ExplainabilityResult,
-    MLResult,
     NLPResult,
     ScanResponse,
     TextAnalysisInput,
     TextAnalysisResponse,
 )
+from app.services.nlp_service import analyze_text
+from app.services.scan_service import execute_account_scan
 
 router = APIRouter()
 
 
-def _mock_scan_response(account: AccountInput) -> ScanResponse:
-    """
-    Builds a schema-valid, clearly-labelled mock ScanResponse.
-
-    Data availability is computed honestly from the input fields.
-    Classification is 'Insufficient evidence' when fewer than 3 fields are provided,
-    so we never claim false certainty.
-    """
-    # Count how many optional fields were actually provided
-    optional_fields = [
-        account.followers,
-        account.following,
-        account.posts,
-        account.account_age_days,
-        account.has_profile_pic,
-        account.bio,
-        account.post_text,
-    ]
-    provided = sum(1 for f in optional_fields if f is not None)
-    data_availability = round(provided / len(optional_fields), 2)
-
-    # Mock classification based on data availability
-    if provided < 2:
-        classification = Classification.insufficient_evidence
-        risk_score = None
-        limitations = [
-            "Fewer than 2 profile fields provided – cannot compute a reliable risk score.",
-            "Account age unknown – recency signals unavailable.",
-            "No post text provided – NLP analysis skipped.",
-        ]
-        indicators: list[str] = []
-    else:
-        # Placeholder heuristics – NOT real ML
-        classification = Classification.suspicious
-        risk_score = 0.61
-        limitations = [
-            "Risk score is a placeholder – real ML pipeline not yet connected.",
-            "Post content not provided – NLP analysis skipped." if not account.post_text else "",
-        ]
-        limitations = [l for l in limitations if l]
-        indicators = [
-            "MOCK: This is a placeholder response – real analysis coming in Step 2.",
-        ]
-
-    return ScanResponse(
-        username=account.username,
-        platform=account.platform.value,
-        classification=classification,
-        risk_score=risk_score,
-        ml_result=MLResult(
-            model_used=None,
-            probability=None,
-            confidence=None,
-            mock=True,
-        ),
-        nlp_result=NLPResult(
-            spam_score=None,
-            sentiment=None,
-            suspicious_phrases=[],
-            mock=True,
-        ),
-        suspicious_indicators=indicators,
-        explainability=ExplainabilityResult(top_features=[], mock=True),
-        recommendations=[
-            "Provide more profile fields to enable a more accurate assessment.",
-        ] if provided < 4 else [
-            "Review the suspicious indicators listed above.",
-            "Cross-reference with platform reporting tools.",
-        ],
-        data_availability=data_availability,
-        limitations=limitations,
-        scanned_at=datetime.utcnow(),
-        mock=True,
-    )
-
-
-@router.post("/scan", response_model=ScanResponse, summary="Scan a single account")
+@router.post(
+    "/scan",
+    response_model=ScanResponse,
+    summary="Scan a single account (Production ML + NLP + SHAP)",
+    description="Validates account input, runs tabular ML, NLP text analysis, SHAP explainability, and the composite risk engine.",
+)
 async def scan_account(account: AccountInput) -> ScanResponse:
-    """
-    Analyses a single social media account for suspicious indicators.
-
-    **Currently returns mock data** (mock=true in response).  
-    The real ML + NLP pipeline will be connected in a later step.
-
-    Outputs are risk *indicators* only. A high risk score does not prove
-    an account is inauthentic.
-    """
-    return _mock_scan_response(account)
+    """Executes a full multi-modal scan on a single account."""
+    return execute_account_scan(account, persist=True)
 
 
 @router.post(
     "/analyze-text",
     response_model=TextAnalysisResponse,
     summary="Standalone NLP text analysis",
+    description="Evaluates bio or post content using TF-IDF + Logistic Regression and heuristic phishing/promotional rules.",
 )
-async def analyze_text(payload: TextAnalysisInput) -> TextAnalysisResponse:
-    """
-    Runs NLP analysis on a text snippet without requiring account metadata.
-
-    **Currently returns mock data** (mock=true in response).
-    """
+async def analyze_text_endpoint(payload: TextAnalysisInput) -> TextAnalysisResponse:
+    """Performs isolated text analysis without requiring account metadata."""
     preview = payload.text[:120] + ("…" if len(payload.text) > 120 else "")
+    nlp_res = analyze_text(bio=payload.text, posts=None)
+
+    top_phrases = [p["phrase"] for p in nlp_res.get("top_suspicious_phrases", [])]
+
+    nlp_result = NLPResult(
+        spam_score=nlp_res.get("text_risk_score"),
+        sentiment=nlp_res.get("text_risk_level"),
+        suspicious_phrases=top_phrases,
+        mock=False,
+    )
+
+    indicators = []
+    for flag in nlp_res.get("rule_based_flags", []):
+        indicators.append(flag)
+
     return TextAnalysisResponse(
         text_preview=preview,
-        nlp_result=NLPResult(
-            spam_score=None,
-            sentiment=None,
-            suspicious_phrases=[],
-            mock=True,
-        ),
-        suspicious_indicators=["MOCK: NLP pipeline not yet connected."],
-        limitations=["TF-IDF model not trained yet – text analysis unavailable."],
-        mock=True,
+        nlp_result=nlp_result,
+        suspicious_indicators=indicators,
+        limitations=nlp_res.get("limitations", []),
+        mock=False,
     )
 
 
-@router.post("/bulk-scan", response_model=BulkScanResponse, summary="Bulk scan up to 100 accounts")
-async def bulk_scan(payload: BulkScanInput) -> BulkScanResponse:
-    """
-    Accepts a list of AccountInput records and returns a ScanResponse for each.
-
-    **Currently returns mock data** (mock=true in response).
-    Max 100 accounts per request.
-    """
-    results = [_mock_scan_response(acc) for acc in payload.accounts]
+@router.post(
+    "/bulk-scan",
+    response_model=BulkScanResponse,
+    summary="Bulk scan JSON list of up to 100 accounts",
+)
+async def bulk_scan_endpoint(payload: BulkScanInput) -> BulkScanResponse:
+    """Executes scans across a list of accounts."""
+    results = [execute_account_scan(acc, persist=True) for acc in payload.accounts]
     return BulkScanResponse(
         total=len(results),
         results=results,
-        mock=True,
+        mock=False,
     )
 
+
+@router.post(
+    "/bulk-scan-csv",
+    response_model=BulkScanResponse,
+    summary="Bulk scan via CSV file upload",
+    description="Upload a CSV file containing social media accounts. Automatically maps platform-specific headers and handles malformed rows gracefully.",
+)
+async def bulk_scan_csv_endpoint(
+    file: UploadFile = File(..., description="CSV file with social media account details"),
+) -> BulkScanResponse:
+    """Uploads and scans accounts from a CSV file."""
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be a valid .csv format.",
+        )
+
+    content = await file.read()
+    try:
+        text_stream = io.StringIO(content.decode("utf-8"))
+    except UnicodeDecodeError:
+        text_stream = io.StringIO(content.decode("latin-1"))
+
+    reader = csv.DictReader(text_stream)
+    if not reader.fieldnames:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file contains no headers or is empty.",
+        )
+
+    results: List[ScanResponse] = []
+    for row in reader:
+        # Skip completely empty lines
+        if not any(row.values()):
+            continue
+        try:
+            # execute_account_scan uses platform adapters to safely normalise headers
+            res = execute_account_scan(row, persist=True)
+            results.append(res)
+        except Exception:
+            # Gracefully handle bad rows without crashing the batch
+            continue
+
+    if not results:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No valid account records could be processed from the CSV.",
+        )
+
+    return BulkScanResponse(
+        total=len(results),
+        results=results,
+        mock=False,
+    )
